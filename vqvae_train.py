@@ -1,177 +1,137 @@
 # vqvae_train.py
-import os
+"""
+Standalone training script for the hierarchical VQ-VAE2 model on HipMRI slices.
+"""
+
+from __future__ import annotations
+
 import argparse
+import os
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from skimage.metrics import structural_similarity as ssim
-import matplotlib.pyplot as plt
 
-# -----------------------
-# Dataset
-# -----------------------
-class MRI2DDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.images = []
-        for patient in os.listdir(root_dir):
-            patient_dir = os.path.join(root_dir, patient)
-            if os.path.isdir(patient_dir):
-                for f in os.listdir(patient_dir):
-                    if f.endswith(".png"):
-                        self.images.append(os.path.join(patient_dir, f))
-        print(f"Found {len(self.images)} images.")
+from dataset import HipMRISliceDataset
+from modules import VQVAE2
+from utils import compute_batch_ssim, save_reconstructions
 
-    def __len__(self):
-        return len(self.images)
 
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        img = Image.open(img_path).convert("L")
-        if self.transform:
-            img = self.transform(img)
-        return img
+def build_dataloader(
+    data_dir: str,
+    mode: str,
+    batch_size: int,
+    num_workers: int,
+    max_slices_per_nifti: int | None,
+) -> DataLoader:
+    dataset = HipMRISliceDataset(
+        data_dir,
+        mode=mode,
+        max_slices_per_nifti=max_slices_per_nifti,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
-# -----------------------
-# VQ-VAE Model
-# -----------------------
-class Encoder(nn.Module):
-    def __init__(self, in_channels=1, hidden_channels=64, latent_dim=64):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 4, 2, 1)
-        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, 4, 2, 1)
-        self.conv3 = nn.Conv2d(hidden_channels, latent_dim, 3, 1, 1)
-        self.relu = nn.ReLU()
 
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.conv3(x)
-        return x
+def train(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
 
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=64, hidden_channels=64, out_channels=1):
-        super().__init__()
-        self.deconv1 = nn.ConvTranspose2d(latent_dim, hidden_channels, 4, 2, 1)
-        self.deconv2 = nn.ConvTranspose2d(hidden_channels, hidden_channels, 4, 2, 1)
-        self.deconv3 = nn.Conv2d(hidden_channels, out_channels, 3, 1, 1)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+    max_slices = None if args.max_slices_per_nifti <= 0 else args.max_slices_per_nifti
+    dataloader = build_dataloader(
+        args.data_dir,
+        args.mode,
+        args.batch_size,
+        args.num_workers,
+        max_slices,
+    )
 
-    def forward(self, x):
-        x = self.relu(self.deconv1(x))
-        x = self.relu(self.deconv2(x))
-        x = self.sigmoid(self.deconv3(x))
-        return x
+    model = VQVAE2(
+        in_ch=1,
+        hidden=args.hidden,
+        num_embed_top=args.num_embed_top,
+        num_embed_bottom=args.num_embed_bottom,
+        commitment_cost=args.commitment_cost,
+    ).to(device)
 
-class VQVAE(nn.Module):
-    def __init__(self, in_channels=1, hidden_channels=64, latent_dim=64):
-        super().__init__()
-        self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_channels, in_channels)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    best_ssim = 0.0
 
-    def forward(self, x):
-        z = self.encoder(x)
-        x_recon = self.decoder(z)
-        return x_recon
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_ssim = 0.0
+        batch_count = 0
 
-# -----------------------
-# Train Function
-# -----------------------
-def train(model, dataloader, device, epochs=50, lr=1e-3):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-    model.train()
-    loss_list = []
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
+        for batch in pbar:
+            imgs = batch.to(device)
+            recon, vq_loss, _ = model(imgs)
+            recon_loss = F.mse_loss(recon, imgs)
+            loss = recon_loss + vq_loss
 
-    for epoch in range(epochs):
-        running_loss = 0
-        for imgs in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
-            imgs = imgs.to(device)
             optimizer.zero_grad()
-            recon = model(imgs)
-            loss = criterion(recon, imgs)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
-        avg_loss = running_loss / len(dataloader)
-        loss_list.append(avg_loss)
-        print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.6f}")
 
-    # 绘制 loss 曲线
-    plt.figure()
-    plt.plot(loss_list, label="Train Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.legend()
-    plt.savefig("outputs/loss_curve.png")
-    print("✅ Loss curve saved to outputs/loss_curve.png")
-    return model
+            total_loss += loss.item()
+            batch_ssim = compute_batch_ssim(imgs, recon)
+            total_ssim += batch_ssim
+            batch_count += 1
+            pbar.set_postfix(
+                loss=loss.item(),
+                recon=recon_loss.item(),
+                ssim=batch_ssim,
+            )
 
-# -----------------------
-# Generate Samples
-# -----------------------
-def generate_samples(model, dataloader, device, n_samples=5):
-    os.makedirs("outputs/generated", exist_ok=True)
-    model.eval()
-    with torch.no_grad():
-        for i, imgs in enumerate(dataloader):
-            imgs = imgs.to(device)
-            recon = model(imgs)
-            for j in range(min(n_samples, recon.size(0))):
-                orig = imgs[j].cpu().numpy().squeeze()
-                recon_img = recon[j].cpu().numpy().squeeze()
-                # 保存原图和重建图
-                plt.imsave(f"outputs/generated/orig_{i}_{j}.png", orig, cmap='gray')
-                plt.imsave(f"outputs/generated/recon_{i}_{j}.png", recon_img, cmap='gray')
-                # 计算 SSIM
-                s = ssim(orig, recon_img)
-                print(f"Image {i}_{j} SSIM: {s:.4f}")
-            if i >= n_samples-1:
-                break
-    print("✅ Samples generated in outputs/generated/")
+        avg_loss = total_loss / max(1, batch_count)
+        avg_ssim = total_ssim / max(1, batch_count)
+        print(f"Epoch {epoch}: loss={avg_loss:.4f} | ssim={avg_ssim:.4f}")
 
-# -----------------------
-# Main
-# -----------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="processed_slices")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--generate", action="store_true")
-    parser.add_argument("--model_path", type=str, default="outputs/vqvae_model.pth")
-    args = parser.parse_args()
+        # 保存可视化
+        sample_dir = Path(args.output_dir) / "samples"
+        save_reconstructions(imgs.detach().cpu(), recon.detach().cpu(), str(sample_dir), prefix=f"epoch{epoch}")
 
-    os.makedirs("outputs", exist_ok=True)
+        if avg_ssim > best_ssim:
+            best_ssim = avg_ssim
+            ckpt_path = Path(args.output_dir) / "best_vqvae2.pth"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved new best model to {ckpt_path} (SSIM={best_ssim:.4f})")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # 保存最后一次模型
+    last_ckpt = Path(args.output_dir) / "last_vqvae2.pth"
+    torch.save(model.state_dict(), last_ckpt)
+    print(f"Training finished. Final model saved to {last_ckpt}")
 
-    transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor()
-    ])
 
-    dataset = MRI2DDataset(args.data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--mode", type=str, default="nifti", choices=["nifti", "img"])
+    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--num_embed_top", type=int, default=512)
+    parser.add_argument("--num_embed_bottom", type=int, default=512)
+    parser.add_argument("--commitment_cost", type=float, default=0.25)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--max_slices_per_nifti",
+        type=int,
+        default=100,
+        help="Limit number of slices sampled per NIfTI (<=0 keeps all slices).",
+    )
+    return parser.parse_args()
 
-    model = VQVAE().to(device)
-
-    if args.generate:
-        model.load_state_dict(torch.load(args.model_path, map_location=device))
-        generate_samples(model, dataloader, device)
-    else:
-        trained_model = train(model, dataloader, device, epochs=args.epochs, lr=args.lr)
-        torch.save(trained_model.state_dict(), args.model_path)
-        print(f"✅ Model saved to {args.model_path}")
 
 if __name__ == "__main__":
-    main()
+    train(parse_args())
