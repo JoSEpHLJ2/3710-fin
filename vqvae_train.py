@@ -1,4 +1,4 @@
-# vqvae_train.py
+# vqvae2_train.py
 import os
 import argparse
 import torch
@@ -7,10 +7,10 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import numpy as np
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim
-import matplotlib.pyplot as plt
+from modules import VQVAE2  # 请确保 modules.py 中有 VQVAE2 类
 
 # -----------------------
 # Dataset
@@ -39,64 +39,24 @@ class MRI2DDataset(Dataset):
         return img
 
 # -----------------------
-# VQ-VAE Model
+# Train function
 # -----------------------
-class Encoder(nn.Module):
-    def __init__(self, in_channels=1, hidden_channels=64, latent_dim=64):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 4, 2, 1)
-        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, 4, 2, 1)
-        self.conv3 = nn.Conv2d(hidden_channels, latent_dim, 3, 1, 1)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.conv3(x)
-        return x
-
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=64, hidden_channels=64, out_channels=1):
-        super().__init__()
-        self.deconv1 = nn.ConvTranspose2d(latent_dim, hidden_channels, 4, 2, 1)
-        self.deconv2 = nn.ConvTranspose2d(hidden_channels, hidden_channels, 4, 2, 1)
-        self.deconv3 = nn.Conv2d(hidden_channels, out_channels, 3, 1, 1)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x = self.relu(self.deconv1(x))
-        x = self.relu(self.deconv2(x))
-        x = self.sigmoid(self.deconv3(x))
-        return x
-
-class VQVAE(nn.Module):
-    def __init__(self, in_channels=1, hidden_channels=64, latent_dim=64):
-        super().__init__()
-        self.encoder = Encoder(in_channels, hidden_channels, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_channels, in_channels)
-
-    def forward(self, x):
-        z = self.encoder(x)
-        x_recon = self.decoder(z)
-        return x_recon
-
-# -----------------------
-# Train Function
-# -----------------------
-def train(model, dataloader, device, epochs=50, lr=1e-3):
+def train(model, dataloader, device, epochs=50, lr=1e-4, save_dir="outputs"):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     model.train()
+    os.makedirs(save_dir, exist_ok=True)
     loss_list = []
 
     for epoch in range(epochs):
         running_loss = 0
-        for imgs in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        for imgs in pbar:
             imgs = imgs.to(device)
             optimizer.zero_grad()
-            recon = model(imgs)
-            loss = criterion(recon, imgs)
+            recon, vq_loss, _ = model(imgs)
+            recon_loss = criterion(recon, imgs)
+            loss = recon_loss + vq_loss
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -104,38 +64,42 @@ def train(model, dataloader, device, epochs=50, lr=1e-3):
         loss_list.append(avg_loss)
         print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.6f}")
 
-    # 绘制 loss 曲线
+        # 保存每轮的重建样本（前 4 张）
+        recon_imgs = recon.detach()[:4]
+        for i in range(recon_imgs.size(0)):
+            plt.imsave(os.path.join(save_dir, f"recon_epoch{epoch+1}_{i}.png"),
+                       recon_imgs[i].cpu().numpy().squeeze(), cmap='gray')
+
+    # 保存 loss 曲线
     plt.figure()
     plt.plot(loss_list, label="Train Loss")
     plt.xlabel("Epoch")
     plt.ylabel("MSE Loss")
     plt.legend()
-    plt.savefig("outputs/loss_curve.png")
-    print("✅ Loss curve saved to outputs/loss_curve.png")
+    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
+    print(f"✅ Loss curve saved to {save_dir}/loss_curve.png")
     return model
 
 # -----------------------
-# Generate Samples
+# 生成样本函数
 # -----------------------
-def generate_samples(model, dataloader, device, n_samples=5):
-    os.makedirs("outputs/generated", exist_ok=True)
+def generate_samples(model, dataloader, device, save_dir="outputs/generated", n_samples=5):
+    os.makedirs(save_dir, exist_ok=True)
     model.eval()
     with torch.no_grad():
         for i, imgs in enumerate(dataloader):
             imgs = imgs.to(device)
-            recon = model(imgs)
+            recon, _, _ = model(imgs)
             for j in range(min(n_samples, recon.size(0))):
                 orig = imgs[j].cpu().numpy().squeeze()
                 recon_img = recon[j].cpu().numpy().squeeze()
-                # 保存原图和重建图
-                plt.imsave(f"outputs/generated/orig_{i}_{j}.png", orig, cmap='gray')
-                plt.imsave(f"outputs/generated/recon_{i}_{j}.png", recon_img, cmap='gray')
-                # 计算 SSIM
-                s = ssim(orig, recon_img)
+                plt.imsave(os.path.join(save_dir, f"orig_{i}_{j}.png"), orig, cmap='gray')
+                plt.imsave(os.path.join(save_dir, f"recon_{i}_{j}.png"), recon_img, cmap='gray')
+                s = ssim(orig, recon_img, data_range=1.0)
                 print(f"Image {i}_{j} SSIM: {s:.4f}")
             if i >= n_samples-1:
                 break
-    print("✅ Samples generated in outputs/generated/")
+    print(f"✅ Samples saved to {save_dir}/")
 
 # -----------------------
 # Main
@@ -144,13 +108,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="processed_slices")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--num_embed_top", type=int, default=512)
+    parser.add_argument("--num_embed_bottom", type=int, default=512)
+    parser.add_argument("--commitment", type=float, default=0.25)
     parser.add_argument("--generate", action="store_true")
-    parser.add_argument("--model_path", type=str, default="outputs/vqvae_model.pth")
+    parser.add_argument("--model_path", type=str, default="outputs/vqvae2_model.pth")
     args = parser.parse_args()
-
-    os.makedirs("outputs", exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -163,13 +129,17 @@ def main():
     dataset = MRI2DDataset(args.data_dir, transform=transform)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    model = VQVAE().to(device)
+    model = VQVAE2(in_ch=1, hidden=args.hidden,
+                   num_embed_top=args.num_embed_top,
+                   num_embed_bottom=args.num_embed_bottom,
+                   commitment_cost=args.commitment).to(device)
 
     if args.generate:
         model.load_state_dict(torch.load(args.model_path, map_location=device))
         generate_samples(model, dataloader, device)
     else:
-        trained_model = train(model, dataloader, device, epochs=args.epochs, lr=args.lr)
+        trained_model = train(model, dataloader, device,
+                              epochs=args.epochs, lr=args.lr)
         torch.save(trained_model.state_dict(), args.model_path)
         print(f"✅ Model saved to {args.model_path}")
 
