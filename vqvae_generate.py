@@ -1,66 +1,73 @@
-# vqvae_generate.py
-import os
+"""Generate reconstructions using a trained VQ-VAE2 checkpoint."""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
+
 from dataset import HipMRISliceDataset
 from modules import VQVAE2
-from PIL import Image
-import torchvision.transforms as transforms
+from utils import save_reconstructions
 
-# -----------------------
-# 配置
-# -----------------------
-data_root = "processed_slices"           # 输入PNG图像根目录
-model_path = "outputs/vqvae_model.pth"  # 已训练好的模型
-output_gen_dir = Path("outputs/generated")
-output_cmp_dir = Path("outputs/comparison")  # 可选：原图+生成图对比
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-# -----------------------
-# 数据集和DataLoader
-# -----------------------
-dataset = HipMRISliceDataset(data_root, mode='img', transform=transforms.ToTensor())
-dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_dir", type=Path, default=Path("data"))
+    parser.add_argument("--mode", choices=["nifti", "img"], default="nifti")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output_dir", type=Path, default=Path("outputs/generate"))
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--num_embed_top", type=int, default=512)
+    parser.add_argument("--num_embed_bottom", type=int, default=512)
+    parser.add_argument("--commitment_cost", type=float, default=0.25)
+    parser.add_argument("--max_slices_per_nifti", type=int, default=100)
+    return parser.parse_args()
 
-# -----------------------
-# 加载模型
-# -----------------------
-model = VQVAE2().to(device)
-model.load_state_dict(torch.load(model_path, map_location=device))
-model.eval()
 
-# -----------------------
-# 遍历生成
-# -----------------------
-for idx, img_tensor in enumerate(dataloader):
-    img_tensor = img_tensor.to(device)  # [B, C, H, W]
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dataset = HipMRISliceDataset(
+        str(args.data_dir),
+        mode=args.mode,
+        max_slices_per_nifti=None if args.max_slices_per_nifti <= 0 else args.max_slices_per_nifti,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    model = VQVAE2(
+        in_ch=1,
+        hidden=args.hidden,
+        num_embed_top=args.num_embed_top,
+        num_embed_bottom=args.num_embed_bottom,
+        commitment_cost=args.commitment_cost,
+    ).to(device)
+    state = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
     with torch.no_grad():
-        recon, _, _ = model(img_tensor)
+        for batch_idx, imgs in enumerate(loader):
+            imgs = imgs.to(device)
+            recon, _, _ = model(imgs)
+            save_reconstructions(imgs.cpu(), recon.cpu(), str(args.output_dir), prefix=f"batch{batch_idx}")
+            if batch_idx >= 4:  # 导出前几个 batch 即可
+                break
+    print(f"Generated samples saved to {args.output_dir}")
 
-    # 转为 PIL Image
-    recon_img = recon[0,0].cpu().mul(255).byte().numpy()
-    recon_pil = Image.fromarray(recon_img)
 
-    # 获取原图路径信息
-    orig_path = Path(dataset.items[idx][1])
-    case_folder = orig_path.parent.name
-    # 保存生成图
-    case_output_dir = output_gen_dir / case_folder
-    case_output_dir.mkdir(parents=True, exist_ok=True)
-    recon_pil.save(case_output_dir / orig_path.name)
-
-    # 可选：保存原图+生成图对比图
-    cmp_dir = output_cmp_dir / case_folder
-    cmp_dir.mkdir(parents=True, exist_ok=True)
-    orig_img = Image.open(orig_path).convert("L")
-    cmp_image = Image.new("L", (orig_img.width * 2, orig_img.height))
-    cmp_image.paste(orig_img, (0,0))
-    cmp_image.paste(recon_pil, (orig_img.width,0))
-    cmp_image.save(cmp_dir / orig_path.name)
-
-    if idx % 100 == 0:
-        print(f"Processed {idx+1}/{len(dataset)} images")
-
-print("✅ Generation finished. Generated images in 'outputs/generated/' and comparisons in 'outputs/comparison/'")
+if __name__ == "__main__":
+    main()
